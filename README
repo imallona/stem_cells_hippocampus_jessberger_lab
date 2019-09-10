@@ -1,0 +1,21 @@
+## Aim
+
+Supplementary data to _Lorem ipsum dolor sit amet, consectetur adipiscing elit_.
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Proin lacinia neque enim, vel egestas elit lobortis sit amet. Fusce ultrices odio at leo porttitor lacinia. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Curabitur ex purus, auctor eu egestas et, lobortis in nisl. Vivamus pharetra efficitur felis. Donec tincidunt scelerisque magna, sed rutrum quam interdum ac. Donec suscipit ultricies cursus. Proin sodales porttitor nisl venenatis rutrum. Fusce ac faucibus dui. Fusce dictum mauris turpis, id lacinia sapien semper ac. Etiam at urna eget sapien fringilla bibendum. Donec finibus vestibulum purus, sed lacinia nulla malesuada nec.
+
+## Repository structure
+
+- `data`, processed data / annotations
+- `diff_expression`, differential expression analysis (Seurat-based)
+- `mapping_and_velocyto`, STAR + featurecounts + velocyto workflow to retrieve count matrices and velocyto's loom files
+- `velocyto_batch_removal`, `velocyto.R`-based run accounting for batch effects
+
+## Requirements
+
+- TODO
+
+## To do list
+
+- add links to GEO/SRA data
+- document
