@@ -1,0 +1,586 @@
+---
+title: "01 Baptiste Jaeger descriptive"
+params:
+  seed: 1
+author: "Izaskun Mallona (Mark Robinson lab)"
+output:
+  html_document:
+    keep_md: false
+    toc: true
+    toc_float: true
+    toc_depth: 4
+
+---
+
+
+```{r tag}
+analysis_tag <- '01_jaeger_descriptive'
+```
+
+```{r libraries, include=TRUE, cache = FALSE}
+library(pheatmap)
+library(knitr)
+library(scater)
+library(Seurat)
+library(Cairo)  
+library(biomaRt)
+library(dplyr)
+## library(reshape2)
+#library(iSEE)
+library(Matrix)
+library(scran)
+## library(mvoutlier)
+## library(shiny)
+## library(kableExtra)
+## library(velocyto.R)
+## library(cowplot)
+## library(corrplot)
+library(DT)
+library(viridis)
+## library("CellMixS")
+
+```
+
+```{r knitr_setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NULL, warning = TRUE,
+                      cache = TRUE, tidy = TRUE, tidy.opts = list(width.cutoff=60))
+
+options(bitmapType="cairo")
+
+```
+
+```{r functions}
+ac <-  function(col, alpha=1){
+
+    apply(sapply(col, col2rgb)/255, 2, 
+          function(x) 
+              rgb(x[1], x[2], x[3], alpha=alpha))  
+}
+```
+
+
+# Data load
+
+Raw counts retrieval. Assumes all matrices share gene id and gene names
+
+```{r}
+fns <- list.files(file.path('..', 'data'), '*gz')
+ec <- list()
+
+for (fn in fns) {
+    tag <- gsub('_rawCount.txt.gz', '', basename(fn))
+    ec[[tag]] <- read.table(file.path('..', 'data', fn),
+                            sep = '\t',
+                            header = TRUE)
+    rownames(ec[[tag]]) <- sprintf('%s_%s', ec[[tag]]$gene_id, ec[[tag]]$gene_name )
+    gene_ids <- ec[[tag]]$gene_id
+    ec[[tag]] <- ec[[tag]][,-c(1,2)]
+    
+}
+
+sapply(ec, function(x) head(colnames(x)))
+```
+
+Checking all rownames are equivalent
+
+```{r}
+for (item in names(ec)) {
+    for (item2 in names(ec)) {
+        stopifnot(all(rownames(ec[[item]]) == rownames(ec[[item2]])))
+    }
+}
+```
+
+Metadata (currently just the plate)
+
+```{r}
+meta <- list()
+for (tag in names(ec)) {
+    meta[[tag]] <- data.frame(cell = colnames(ec[[tag]]),
+                              plate = tag)
+    rownames(meta[[tag]]) <- meta[[tag]]$cell
+}
+```
+# Annotation, preQC
+
+
+```{r sce}
+sce <- list()
+
+for (item in names(ec)) {
+    stopifnot(all(rownames(meta[[item]]) == colnames(ec[[item]])))
+    sce[[item]] <- SingleCellExperiment(list(counts = as.matrix(ec[[item]])),
+                                        colData = meta[[item]])
+
+}
+```
+
+Checking all rownames are identical
+
+```{r}
+for (item in names(sce)) {
+    for (item2 in names(sce)) {
+        stopifnot(all(rownames(sce[[item]]) == rownames(sce[[item2]])))
+    }
+}
+```
+
+## Genes annotation
+
+Getting gene feature annotation. Assumes all data matrices share the same ensembl GIDs, and that this is mouse data. Only queries it the first time.
+
+```{r annotation, message = FALSE, warning = FALSE, cache = FALSE}
+
+if (!file.exists(file.path('..', 'data', 'gene_annotation.RData'))) {
+    ## ids = gene_ids
+    filters = "ensembl_gene_id"
+    attributes = c(filters, "chromosome_name", 
+                   "gene_biotype", "start_position", "end_position")
+    biomart = "ENSEMBL_MART_ENSEMBL"
+    dataset = "mmusculus_gene_ensembl"
+    host = "www.ensembl.org"
+
+    bmart <- biomaRt::useMart(biomart = biomart, dataset = dataset, 
+                              host = host)
+
+    feature_info <- biomaRt::getBM(attributes = attributes, filters = filters, 
+                                   values = gene_ids, mart = bmart)
+
+    mm <- match(gene_ids, feature_info[[filters]])
+    feature_info_full <- feature_info[mm, ]
+    save(feature_info_full, file = file.path('..', 'data', 'gene_annotation.RData'))
+} else {
+   load(file.path('..', 'data', 'gene_annotation.RData'))
+    
+}
+
+for (item in names(sce)) {
+    object <- sce[[item]]
+    old_rdata <- rowData(object)
+    keep_cols <- !(colnames(old_rdata) %in% colnames(feature_info_full))
+    new_rdata <- cbind(old_rdata[, keep_cols], feature_info_full)
+    rowData(object) <- new_rdata
+
+    rowData(object)$ensembl_gene_id <- gene_ids
+    sce[[item]] <- object
+    rm(object, old_rdata, keep_cols, new_rdata)
+}
+
+```
+
+## Mitochondrial/spike ins
+
+Looking for mitochondrial/spike ins for filtering out cells afterwards.
+
+We exclude genes that are not expressed in any cell.
+
+```{r mitoc}
+
+for (item in names(sce)) {
+    
+    sce[[item]] <- sce[[item]][rowSums(counts(sce[[item]]) > 0) > 0, ]
+
+    is.mt <- grepl('MT', rowData(sce[[item]])$chromosome_name)
+    is.spike <- grepl('ERCC-',  rownames(rowData(sce[[item]])))
+    isSpike(sce[[item]], "Spike") <- is.spike
+
+
+    dim(sce[[item]])
+    ## sce[[item]] <- normalize(sce[[item]])
+    sce[[item]] <- calculateQCMetrics(sce[[item]], 
+                                      feature_controls = list(ERCC = is.spike,
+                                                              mito = is.mt))
+}
+```
+
+# Overall quality metrics
+
+Mind the bump in library sizes, are these cells duplets or different anyhow?
+
+```{r scater_plots}
+
+for (item in names(sce)) {
+    print(item)   
+    par(mfrow=c(2,2), mar=c(5.1, 4.1, 0.1, 0.1))
+    hist(sce[[item]]$total_counts/1e3, xlab="Library sizes (thousands)", main="", 
+         breaks=20, col="grey80", ylab="Number of cells")
+    hist(sce[[item]]$total_features_by_counts, xlab="Number of expressed genes", main="", 
+         breaks=20, col="grey80", ylab="Number of cells")
+    hist(sce[[item]]$pct_counts_Spike, xlab="ERCC proportion (%)",
+         ylab="Number of cells", breaks=20, main="", col="grey80")
+    hist(sce[[item]]$pct_counts_mito, xlab="Mitochondrial proportion (%)", 
+         ylab="Number of cells", breaks=20, main="", col="grey80")
+}
+
+```
+
+```{r library_sizes}
+for (item in names(sce)) {
+    print(item)  
+    par(mfrow=c(2,2), mar=c(5.1, 4.1, 1.1, 1.1))
+
+    plot(density(sce[[item]]$total_counts/1e3),
+         xlab = "library sizes (thousands)",
+         main = '')
+
+    rug(sce[[item]]$total_counts/1e3)
+
+    plot(y = sce[[item]]$total_counts/1e3,
+         x = sce[[item]]$pct_counts_mito,
+         pch = 20,
+         ylab = 'library size (thousands)',
+         xlab = 'mitochondrial proportion (%)',
+         col = ac('black', 0.5))
+
+    plot(y = sce[[item]]$total_counts/1e3,
+         x = sce[[item]]$total_features_by_counts,
+         pch = 20,
+         ylab = 'library size (thousands)',
+         xlab = 'number of genes',
+         col = ac('black', 0.5))
+
+    plot(y = sce[[item]]$pct_counts_mito,
+         x = sce[[item]]$total_features_by_counts,
+         pch = 20,
+         xlab = 'number of genes',
+         ylab = 'mitochondrial proportion (%)',
+         col = ac('black', 0.5))
+}    
+```
+
+
+
+## Outlier removal
+
+Removal of outliers for the library size and the number of expressed features and mitochondrial proportions.
+
+```{r outliers, cache = FALSE}
+for (item in names(sce)) {
+    print(item)
+    
+    libsize.drop <- isOutlier(sce[[item]]$total_counts, nmads=3, type="lower", log=TRUE)
+    ## feature.drop <- isOutlier(sce[[item]]$total_features_by_counts, nmads=3, type="lower",
+    ##                           log=TRUE)
+    feature.drop <- sce[[item]]$total_features_by_counts >= 5000 | sce[[item]]$total_features_by_counts < 1500
+    
+    spike.drop <- isOutlier(sce[[item]]$pct_counts_Spike, nmads=3, type="higher")
+    mito.drop <- isOutlier(sce[[item]]$pct_counts_mito, nmads=2, type="higher")
+    
+    manualmito.drop <- sce[[item]]$pct_counts_mito >= 5
+
+    ## extra libsize outlier (manual)
+    ## manuallibsize.drop <- sce[[item]]$total_counts < 100000
+
+    sce[[item]] <- sce[[item]][,!(libsize.drop | feature.drop | spike.drop | mito.drop |  manualmito.drop)]
+    print(data.frame(ByLibSize=sum(libsize.drop), ByFeature=sum(feature.drop),
+                     BySpike=sum(spike.drop), ByMito=sum(mito.drop),
+                     ByManualMitoDrop=sum(manualmito.drop[!mito.drop]),
+                     Remaining=ncol(sce[[item]])))
+
+}
+```
+
+# Overall quality metrics after outlier removal
+
+Cell QC (number of genes detected, number of reads, mitochondrial) after outlier removal.
+
+```{r scater_plots_after_filtering, cache = FALSE}
+
+for (item in names(sce)) {
+    print(item)
+    
+    par(mfrow=c(2,2), mar=c(5.1, 4.1, 0.1, 0.1))
+    hist(sce[[item]]$total_counts/1e3, xlab="Library sizes (thousands)", main="",
+         breaks=20, col="grey80", ylab="Number of cells")
+    hist(sce[[item]]$total_features_by_counts, xlab="Number of expressed genes", main="",
+         breaks=20, col="grey80", ylab="Number of cells")
+    hist(sce[[item]]$pct_counts_Spike, xlab="ERCC proportion (%)",
+         ylab="Number of cells", breaks=20, main="", col="grey80")
+    hist(sce[[item]]$pct_counts_mito, xlab="Mitochondrial proportion (%)",
+         ylab="Number of cells", breaks=20, main="", col="grey80")
+}
+```
+
+
+```{r library_sizes2, cache = FALSE}
+for (item in names(sce)) {
+    print(item)
+
+    par(mfrow=c(2,2), mar=c(5.1, 4.1, 1.1, 1.1))
+
+    plot(density(sce[[item]]$total_counts/1e3),
+         xlab = "library sizes (thousands)",
+         main = '')
+
+    rug(sce[[item]]$total_counts/1e3)
+
+    plot(y = sce[[item]]$total_counts/1e3,
+         x = sce[[item]]$pct_counts_mito,
+         pch = 20,
+         ylab = 'library size (thousands)',
+         xlab = 'mitochondrial proportion (%)',
+         col = ac('black', 0.5))
+
+    plot(y = sce[[item]]$total_counts/1e3,
+         x = sce[[item]]$total_features_by_counts,
+         pch = 20,
+         ylab = 'library size (thousands)',
+         xlab = 'number of genes',
+         col = ac('black', 0.5))
+
+    plot(y = sce[[item]]$pct_counts_mito,
+         x = sce[[item]]$total_features_by_counts,
+         pch = 20,
+         xlab = 'number of genes',
+         ylab = 'mitochondrial proportion (%)',
+         col = ac('black', 0.5))
+}
+```
+
+
+## QC plots
+
+In this setting, feature controls are mitochondrial genes.
+
+```{r qccoldata, fig.height = 4, fig.width =6}
+for (item in names(sce)) {
+    print(item)
+
+    print(plotHighestExprs(sce[[item]], exprs_values = "counts"))
+
+    p1 <- plotColData(sce[[item]], x = "total_counts",
+                      y = "total_features_by_counts")
+    p2 <- plotColData(sce[[item]], x = "pct_counts_feature_control",
+                      y = "total_features_by_counts")
+    p3 <- plotColData(sce[[item]], x = "pct_counts_feature_control",
+                      y = "pct_counts_in_top_50_features")
+
+    p4 <- plotColData(sce[[item]], x = "total_counts",
+                      y = "pct_counts_in_top_500_features")
+
+    multiplot(p1, p2, cols = 2)
+    multiplot(p3, p4, cols = 2)
+}
+
+```
+
+## Filter lowly expressed genes and normalize
+
+
+```{r lowly_norm, warning = FALSE}
+for (item in names(sce)) {
+    tryCatch({
+        print(item)
+
+        genes_keep <- rowSums(counts(sce[[item]]) > 1) >= 10
+        sce[[item]] <- sce[[item]][genes_keep, ]
+        sce[[item]] <- scran::computeSumFactors(sce[[item]])
+        ## no spike ins here
+        ## sce[[item]] <- scran::computeSpikeFactors(sce[[item]])
+        sce[[item]] <- normalize(sce[[item]])
+    }, error = function(x) print(x))
+}
+```
+
+## Cell cycle classification
+
+Cell cycle phase estimation (mouse)
+
+```{r cell_cycle}
+for (item in names(sce)) {
+    print(item)
+
+    mouse.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", package="scran"))
+    assignments <- cyclone(sce[[item]], mouse.pairs,
+                           gene.names=rowData(sce[[item]])$ensembl_gene_id)
+    print(table(assignments$phase))
+
+    colData(sce[[item]])$est_cell_cycle_phase <- assignments$phases
+}
+```
+
+
+
+# Dimensionality reduction visualizations
+
+## Unintegrated
+
+Transformation to Seurat v3 objects. Please note that during data scaling we regress out both number of UMIs (in this case this means library size, because the protocol has no UMIs on it) and the mitochondrial proportions.
+
+
+```{r dims_threshold}
+RANGE_PCS <- 1:30
+```
+
+```{r asseurat, warning = FALSE}
+
+## https://satijalab.org/seurat/pancreas_integration_label_transfer.html
+
+so <- list()
+
+for (item in names(sce)) {
+    print(item)
+
+    so[[item]] <- as.Seurat(sce[[item]])
+    so[[item]]@meta.data$orig.ident <- so[[item]]@meta.data$plate
+    Idents(so[[item]]) <- 'plate'
+}
+
+
+```
+
+First evaluating the unintegrated data structure
+
+```{r plot_unintegrated, warning = FALSE, message = FALSE}
+
+## so <- set.all.ident(so, id = identity)
+
+
+merged <- merge(x = so[[1]], y = so[2:length(so)])
+merged <- NormalizeData(object = merged)
+merged <- FindVariableFeatures(object = merged)
+merged <- ScaleData(object = merged)
+merged <- RunPCA(object = merged)
+merged <- FindNeighbors(object = merged)
+merged <- FindClusters(object = merged)
+
+merged <- RunTSNE(object = merged)
+merged <- RunUMAP(object = merged, reduction = "pca",
+                      dims = RANGE_PCS)
+
+p <- DimPlot(object = merged, reduction = "tsne", group.by = 'plate')
+print(p + theme(legend.position="bottom"))
+
+
+p2 <- DimPlot(object = merged, reduction = "umap", group.by = "plate",
+              label = TRUE, repel = TRUE) + NoLegend()
+
+print(p2)
+rm(merged)
+
+```
+
+## Integrated
+
+Second, CCA+MNN Seurat v3 integration
+
+```{r integration, message = FALSE}
+for (i in 1:length(so)) {
+    so[[i]] <- NormalizeData(object = so[[i]], verbose = FALSE)
+    so[[i]] <- FindVariableFeatures(object = so[[i]],
+                                    selection.method = "vst",
+                                    nfeatures = 2000, verbose = FALSE)
+}
+
+jaeger.anchors <- FindIntegrationAnchors(object.list = so, dims = RANGE_PCS)
+
+integrated <- IntegrateData(anchorset = jaeger.anchors, dims = RANGE_PCS)
+
+DefaultAssay(object = integrated) <- "integrated"
+
+## Run the standard workflow for visualization and clustering
+integrated <- ScaleData(object = integrated,
+                        verbose = FALSE,
+                        display.progress = FALSE,
+                        vars.to.regress = c("nUMI", "pct_counts_mito"))
+
+integrated <- RunPCA(object = integrated, npcs = max(RANGE_PCS), verbose = FALSE)
+integrated <- RunTSNE(object = integrated, npcs = max(RANGE_PCS), verbose = FALSE)
+```
+
+```{r}
+ElbowPlot(integrated)
+RANGE_PCS_RED <- 1:10
+```
+
+```{r}
+integrated <- RunUMAP(object = integrated, reduction = "pca",
+                      dims = RANGE_PCS_RED)
+
+p1 <- DimPlot(object = integrated, reduction = "tsne", group.by = "plate")
+p2 <- DimPlot(object = integrated, reduction = "umap", group.by = "plate",
+    label = TRUE, repel = TRUE) + NoLegend()
+p3 <- DimPlot(object = integrated, reduction = "pca", group.by = "plate")
+
+plot(p3)
+plot(p1)
+plot(p2)
+
+```
+
+
+# Cell clustering
+
+
+```{r, message = FALSE}
+RES <- "integrated_snn_res.1"
+res <- 1
+integrated <- FindNeighbors(object = integrated, dims = RANGE_PCS_RED)
+
+integrated <- FindClusters(object = integrated, resolution = res)
+
+
+integrated@active.assay <- 'RNA'
+
+Idents(object = integrated) <- RES
+
+```
+
+```{r}
+print(DimPlot(object = integrated, reduction = "umap", group.by = "plate"))
+print(FeaturePlot(object = integrated, reduction = "umap", features = "pct_counts_mito"))
+print(FeaturePlot(object = integrated, reduction = "umap", features = "nFeature_RNA"))
+print(FeaturePlot(object = integrated, reduction = "umap", features = "nCount_RNA"))
+print(DimPlot(object = integrated, reduction = "umap", group.by = RES))
+
+```
+
+
+```{r}
+
+markers <- FindAllMarkers(object = integrated, only.pos = TRUE, min.pct = 0.25,
+                          thresh.use = 0.25)
+
+
+DT::datatable(markers %>% as.data.frame() %>% 
+              dplyr::mutate_if(is.numeric, funs(round(., 2))), 
+              extensions = c("Buttons", "FixedColumns"),
+              rownames = FALSE, 
+              options = list(dom = "Bfrtip",
+                             scrollX = TRUE, 
+                             fixedColumns = list(leftColumns = 1),
+                             buttons = c("csv", "excel")))
+
+markers_head <- as.data.frame(markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_logFC))$gene
+
+```
+
+
+```{r, fig.height = 14, fig.width=10}
+## graphics.off()
+pheatmap(GetAssayData(object = integrated)[markers_head, ], color = viridis(100), 
+    cluster_rows = FALSE, cluster_cols = TRUE, show_rownames = TRUE, 
+    show_colnames = FALSE, clustering_distance_cols = "euclidean", 
+    clustering_method = "ward.D2", clustering_distance_rows = "euclidean", 
+    fontsize_row = 12, annotation_col = integrated@meta.data[, c("plate", 
+        "nCount_RNA", "nFeature_RNA", "pct_counts_mito", RES), drop = FALSE] %>% 
+        as.data.frame(), scale = "none")
+```        
+
+# Object export
+
+```{r}
+save(sce, file = sprintf('%s_sce.RData', analysis_tag))
+save(so, file = sprintf('%s_so.RData', analysis_tag))
+
+```
+
+# Session
+
+```{r sessionInfo, cache = 0}
+
+date()
+devtools::session_info()
+
+
+```

@@ -1,0 +1,610 @@
+---
+title: "03 diff expression Jaeger/Jessberger"
+params:
+  seed: 1
+author: "Izaskun Mallona (Mark Robinson lab)"
+output:
+  html_document:
+    keep_md: false
+    toc: true
+    toc_float: true
+    toc_depth: 4
+
+---
+
+
+# Context
+
+Jaeger chez Jessberger provided a Seurat object with clustering results/genotypes/batch effects and asked for a differential expression analysis with batch as blocking factors (Friday 16th Aug 2019).
+
+To be more precise, `Ascl1_5day_2` and `Ascl1_12wk_2` show batch effects they would like to subtract. Analysis are run using edgeR's `glmQLFit` with batch as blocking factor; and logistic regression (`LR`) with batch as latent variables.
+
+Ascl vs Gli comparisons are relevant biologically; days (`5d`, `12 week` etc) are unimportant.
+
+Only genes with at least TPM above 1 in more than 25% of the cells are included into the edgeR glmQLFit to avoid too many false positives for lowly expressed genes.
+
+Only genes represented in 20% of the cells of at least one group are included into the logistic regression analysis.
+
+Datatables can be downloaded to be browsed using R or spreadsheet software.
+
+Some of the markers are plotted as ridgeplots, but the comprehensive list of significant results (adj pvalue < 0.05) can be browsed/downloaded as datatables.
+
+P-value adjustment Bonferroni for LR tests, FDR for edgeR's  `glmQLFit`.
+
+Last results are cluster-wise, e.g. cells are compared according to both genotype (Ascl or Gli) and cluster (MN, IN, etc; annotated by Jessberger people) they belong to.  We provide two analysis for that:
+
+-First markers that are specific for each one of the genotype:cluster combination (that allows to distinguish them from the others). Instead of comparing Ascl vs Gli1 in cluster 1, then in cluster 2 etc what I did was to get the markers that distinguish Ascl:cluster1 from everything else, Ascl:cluster2 from everything else, etc. Thus keeping the 'background' in all comparisons.
+- Second, genotypes comparison within clusters (only mn_ascl vs mn_gli, in_ascl vs in_gli etc).
+
+# Load
+
+```{r tag}
+analysis_tag <- '03_diff_expression'
+```
+
+```{r libraries, include=TRUE, cache = FALSE}
+library(pheatmap)
+library(knitr)
+library(scater)
+library(Seurat)
+library(Cairo)
+library(edgeR)
+library(data.table)
+## library(biomaRt)
+library(dplyr)
+## library(reshape2)
+#library(iSEE)
+## library(Matrix)
+## library(scran)
+## library(mvoutlier)
+## library(shiny)
+## library(kableExtra)
+## library(velocyto.R)
+## library(cowplot)
+## library(corrplot)
+library(DT)
+library(devtools)
+## library(viridis)
+## library("CellMixS")
+library(gplots)
+library(pheatmap)
+
+```
+
+```{r knitr_setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NULL, warning = TRUE,
+                      cache = TRUE, tidy = TRUE, tidy.opts = list(width.cutoff=60))
+
+options(bitmapType="cairo")
+
+```
+
+```{r functions}
+ac <-  function(col, alpha=1){
+
+    apply(sapply(col, col2rgb)/255, 2, 
+          function(x) 
+              rgb(x[1], x[2], x[3], alpha=alpha))  
+}
+
+##' subsets a dge to cells annotated as `genotype` in column
+## ' `clusterwise`; 25% cells with over 1 TPM to be returned
+##'
+##' 
+##' @title dgelist subset
+##' @param dge dgelist
+##' @param genotypes charvector
+##' @param tpm_mat tpm matrix
+##' @return a dgelist object
+##' @author izaskun.mallona@gmail.com
+subset_cells <- function(dge, genotypes, tpm_mat) {
+    mod <- dge
+    cells <- rownames(dge$samples[dge$samples$clusterwise %in% genotypes,])
+    
+    keep <- rownames(tpm_mat)[rowSums(tpm_mat[,cells]>1)>= 0.25*ncol(dge$counts[,cells])]
+    
+    mod$counts <- dge$counts[keep,cells]
+    mod$samples <- dge$samples[cells,]
+    return(mod)
+}
+
+```
+
+
+# Data load
+
+Provided by Jaeger
+
+```{r}
+d <- readRDS(file.path('..', 'data', 'Seurat_object_Gli_Ascl_combi_meta.Robj'))
+```
+
+Checking metadata
+
+```{r}
+           
+table(d@meta.data$group, d@meta.data$cluster)
+table(d@meta.data$group, d@meta.data$batch_group)
+```
+
+
+# Diff expression All cells (all clusters) Gli1 vs Ascl1
+
+edgeR DGEList object (full data)
+
+```{r}
+
+dge_full <- DGEList(counts = as.matrix(GetAssayData(d@assays$RNA, slot = "counts")),
+              samples = d@meta.data)
+               
+```
+
+Annotating genes (Asia biomart mirror because european was down while rendering)
+
+```{r}
+tmp <- list()
+
+tmp$ids = rownames(dge_full$counts)
+
+tmp$filters = "mgi_symbol"
+tmp$attributes = c(tmp$filters, "ensembl_gene_id", "chromosome_name", 
+                   "gene_biotype", "start_position", "end_position")
+tmp$biomart = "ENSEMBL_MART_ENSEMBL" 
+tmp$dataset = "mmusculus_gene_ensembl"
+tmp$host = "asia.ensembl.org"
+tmp$bmart <- biomaRt::useMart(biomart = tmp$biomart, dataset = tmp$dataset, 
+            host = tmp$host)
+
+feature_info <- biomaRt::getBM(attributes = tmp$attributes, filters = tmp$filters, 
+        values = tmp$ids, mart = tmp$bmart)
+mm <- match(tmp$ids, feature_info[[tmp$filters]])
+feature_info_full <- feature_info[mm, ]
+old_rdata <- data.frame(id = rownames(dge_full$counts))
+keep_cols <- !(colnames(old_rdata) %in% colnames(feature_info_full))
+gene_meta_data<- cbind(old_rdata[, keep_cols], feature_info_full)
+rownames(gene_meta_data) <- gene_meta_data[,1]
+gene_meta_data$length <- gene_meta_data$end_position - gene_meta_data$start_position
+## rm(tmp, old_rdata, keep_cols, mm, feature_info)
+```
+
+Removing mitochondrial genes
+
+```{r}
+
+keep <- !grepl('mt-', rownames(dge_full))
+table(keep)
+dge_full <- dge_full[keep,]
+
+```
+
+```{r}
+DefaultAssay(d) <- "RNA"
+keep <- !grepl('mt-', rownames(d@assays$RNA))
+table(keep)
+d <- d[keep,]
+
+```
+
+
+Generating unexact TPMs from raw counts (because we take gene lengths and didn't quantify isoforms)
+
+
+```{r}
+
+## removing NAs
+
+gene_meta_data <- na.omit(gene_meta_data)
+
+genes <- intersect(rownames(dge_full$counts), rownames(gene_meta_data))
+                   
+dge_full$counts <- dge_full$counts[genes,]
+
+x <- dge_full$counts / gene_meta_data[rownames(dge_full$counts),'length']
+tpm_mat <- t( t(x) * 1e6 / colSums(x) )
+
+```
+
+Filtering in only genes with an estimated TPM above 1 in more than 25% of the cells, as in https://www.nature.com/articles/nmeth.4612. TPMs because of the sequencing length bias https://f1000research.com/articles/6-595.
+
+
+```{r}
+dge <- dge_full
+keep <- rowSums(tpm_mat>1)>= 0.25*ncol(dge$counts)
+table(keep)
+dge <- dge[keep,]
+```
+
+
+```{r}
+batch <- dge$samples$batch_group
+genotype <- dge$samples$type
+cluster <- dge$samples$cluster
+
+```
+
+Batch and cluster are full rank, trying to split the batch into a meaningful design
+
+
+```{r}
+alt_batch <- as.character(batch)
+
+alt_batch[alt_batch == 'Ascl1_12wk_1'] <- 'B1'
+alt_batch[alt_batch == 'Ascl1_12wk_2'] <- 'B2'
+alt_batch[alt_batch == 'Ascl1_5day_1'] <- 'B1'
+alt_batch[alt_batch == 'Ascl1_5day_2'] <- 'B2'
+alt_batch[alt_batch == 'Gli1_12wk']    <- 'B1'
+alt_batch[alt_batch == 'Gli1_5day_1']  <- 'B1'
+alt_batch[alt_batch == 'Gli1_5day_2']  <- 'B1'
+alt_batch <- as.factor(alt_batch)
+table(alt_batch)
+```
+
+```{r}
+design <- model.matrix(~  0 +genotype + alt_batch)
+```
+
+
+```{r}
+# norm factors
+dge <- calcNormFactors(dge)
+
+# Fit the NB GLMs with QL methods
+dge <- estimateDisp(dge, design)
+fit <- glmQLFit(dge, design)
+
+```
+
+
+```{r}
+limma::plotMDS(dge, col = as.numeric(as.factor(dge$samples$type)), pch = 19)
+```
+
+
+```{r}
+plotBCV(dge)
+plotQLDisp(fit)
+
+```
+
+
+## Comparing Gli and Ascl genotypes with glmQLF
+
+
+```{r}
+avsgli <- makeContrasts(genotypeAscl1-genotypeGli1, levels=design)
+qlf_genot <- glmQLFTest(fit, contrast=avsgli)
+```
+
+```{r}
+
+tt_genot <- topTags(qlf_genot, adjust.method = 'BH', sort.by = 'PValue',
+                    n = 1e6, p.value = 0.05)
+tt_genot_df <- data.frame(gene = rownames(tt_genot),
+                       tt_genot)
+tt_genot_df$analysis <- 'ascl_vs_gli_glmqlf'
+
+DT::datatable(tt_genot_df %>% as.data.frame() %>% dplyr::mutate_if(is.numeric, 
+    funs(round(., 2))), extensions = c("Buttons", "FixedColumns"), 
+    rownames = FALSE, options = list(dom = "Bfrtip", scrollX = TRUE, 
+        fixedColumns = list(leftColumns = 1), buttons = c("csv", 
+            "excel")))
+
+```
+
+
+```{r}
+hist(tt_genot$table$PValue, 50)
+hist(tt_genot$table$FDR, 50)
+
+plotSmear(qlf_genot)
+```
+
+Heat map of top 50 differentially expressed genes, logCPM as in https://f1000research.com/articles/5-1438
+
+```{r, eval = FALSE, fig.width = 16, fig.height = 10}
+
+
+logCPM <- cpm(dge, prior.count=2, log=TRUE)
+rownames(logCPM) <- rownames(dge$counts)
+colnames(logCPM) <- rownames(dge$samples)
+## table is already sorted
+o <- head(rownames(tt_genot$table), 50)
+
+logCPM <- logCPM[o,]
+logCPM <- t(scale(t(logCPM)))
+
+col.pan <- colorpanel(100, "blue", "white", "red")
+
+## sampling only 100 cells
+set.seed(1)
+logCPM <- logCPM[,sample(1:ncol(logCPM), 100)]
+
+
+
+pheatmap(logCPM, color = col.pan,
+         annotation_col = dge$samples[,c('cluster', 'batch_group', 'type')])
+         
+```
+
+<!-- On top of Seurat object -->
+
+<!-- ```{r} -->
+<!-- DimPlot(d, group.by = 'cluster') -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- DimPlot(d, group.by = 'type') -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- FeaturePlot(d, features = head(o, 5), combine = FALSE, -->
+<!--             shape.by = 'type') -->
+<!-- ``` -->
+
+
+```{r, fig.width = 6, fig.height =12, warning = FALSE, message = FALSE}
+DefaultAssay(d) <- "RNA"
+Idents(d) <- d@meta.data$combi
+RidgePlot(d, head(tt_genot_df$gene), ncol = 2)
+```
+
+## Comparing Gli and Ascl genotypes with logistic regression
+
+In this case, we require 20% of the cells in either Ascl1 or Gli1 to express the gene.
+
+
+Note about differential expression results: it hasthe following columns,
+- gene: the gene symbol
+- p_val : p_val (unadjusted)
+- avg_logFC : log fold-chage of the average expression between the two groups. Positive values indicate that the feature is more highly expressed in the first group.
+- pct.1 : The percentage of cells where the feature is detected in the first group
+- pct.2 : The percentage of cells where the feature is detected in the second group
+- p_val_adj : Adjusted p-value, based on bonferroni correction using all features in the dataset.
+- analysis: a tag describing the analysis carried out
+
+```{r}
+
+alt_batch <- as.character(d@meta.data$batch)
+
+
+alt_batch[alt_batch == 'Ascl1_12wk_1'] <- 'B1'
+alt_batch[alt_batch == 'Ascl1_12wk_2'] <- 'B2'
+alt_batch[alt_batch == 'Ascl1_5day_1'] <- 'B1'
+alt_batch[alt_batch == 'Ascl1_5day_2'] <- 'B2'
+alt_batch[alt_batch == 'Gli1_12wk']    <- 'B1'
+alt_batch[alt_batch == 'Gli1_5day_1']  <- 'B1'
+alt_batch[alt_batch == 'Gli1_5day_2']  <- 'B1'
+alt_batch <- as.factor(alt_batch)
+table(alt_batch)
+d@meta.data$alt_batch <- alt_batch
+
+
+DefaultAssay(d) <- "RNA"
+Idents(d) <- 'type'
+
+markers <- FindMarkers(d,
+                       ident.1 =  'Ascl1',
+                       ident.2 = 'Gli1',
+                       test.use = "LR",
+                       latent.vars = "alt_batch",
+                       min.pct = 0.2)
+
+markers <- markers[order(markers$p_val_adj),]
+markers <- markers[markers$p_val_adj < 0.05,]
+markers$analysis <- 'ascl_vs_gli_lr'
+markers <- data.frame(gene = rownames(markers),
+                      markers)
+
+DT::datatable(markers %>% as.data.frame() %>% dplyr::mutate_if(is.numeric, 
+    funs(round(., 2))), extensions = c("Buttons", "FixedColumns"), 
+    rownames = FALSE, options = list(dom = "Bfrtip", scrollX = TRUE, 
+        fixedColumns = list(leftColumns = 1), buttons = c("csv", "excel")))
+```
+                                                          
+
+```{r, fig.width = 6, fig.height =12, warning = FALSE, message = FALSE}
+
+Idents(d) <- d@meta.data$combi
+RidgePlot(d, head(rownames(markers)), ncol = 2)
+
+
+```
+
+## Comparing the overlap between LR and edgeR
+
+
+
+`````{r}
+
+edge <- data.frame(gene = rownames(tt_genot$table),
+                tt_genot$table)
+
+lr <- data.frame(gene = rownames(markers),
+                 markers)
+
+merged <- merge(edge, lr, by = 'gene', all = TRUE)
+
+nrow(edge)
+nrow(lr)
+length(intersect(edge$gene, lr$gene))
+merged$logFDR <- log10(merged$FDR)
+merged$logp_val_adj <- log10(merged$p_val_adj)
+
+plot(merged[c('logFC',  'avg_logFC', 'logFDR', 'logp_val_adj')])
+
+
+```
+
+# Unsupervised genotype:cluster-wise DE analysis
+
+Getting the markers that are characteristic of each genotype:cluster combination (as compared to the rest).
+
+
+```{r, warning = FALSE, cache = TRUE}
+DefaultAssay(d) <- "RNA"
+Idents(d) <- 'combi'
+markers_combi <- FindAllMarkers(d,
+                          test.use = "LR",
+                          latent.vars = "alt_batch",
+                          min.pct = 0.2)
+
+markers_combi <- markers_combi[markers_combi$p_val_adj < 0.05,]
+markers_combi$analysis <- 'all_markers_lr'
+
+DT::datatable(markers_combi %>% as.data.frame() %>% dplyr::mutate_if(is.numeric, 
+    funs(round(., 2))), extensions = c("Buttons", "FixedColumns"), 
+    rownames = FALSE, options = list(dom = "Bfrtip", scrollX = TRUE, 
+        fixedColumns = list(leftColumns = 1), buttons = c("csv", 
+                                                          "excel")))
+
+
+
+```
+
+# Planned genotype:cluster-wise comparisons
+
+Finally, genotypes comparison within clusters, e.g. for cluster MN comparing cells from mn_ascl vs mn_gli; for IN cells, coparing in_ascl vs in_gli etc.
+
+
+## Ascl vs Gli for cluster ndNSC
+
+```{r, warning = FALSE}
+DefaultAssay(d) <- "RNA"
+Idents(d) <- 'combi'
+
+markers <- FindMarkers(d,
+                       ident.1 =  'Ascl1_ndNSC',
+                       ident.2 = 'Gli1_ndNSC',
+                       test.use = "LR",
+                       latent.vars = "alt_batch",
+                       min.pct = 0.2)
+
+markers <- markers[order(markers$p_val_adj),]
+markers <- markers[markers$p_val_adj < 0.05,]
+markers$analysis <- 'asclndnsc_glindnsc_lr'
+markers <- data.frame(gene = rownames(markers),
+                      markers)
+
+DT::datatable(markers %>% as.data.frame() %>% dplyr::mutate_if(is.numeric, 
+    funs(round(., 2))), extensions = c("Buttons", "FixedColumns"), 
+    rownames = FALSE, options = list(dom = "Bfrtip", scrollX = TRUE, 
+        fixedColumns = list(leftColumns = 1), buttons = c("csv", 
+                                                          "excel")))
+
+```
+
+
+```{r, fig.width = 6, fig.height = 12, warning = FALSE, message = FALSE}
+Idents(d) <- 'combi'
+RidgePlot(d, head(rownames(markers)), ncol = 2)
+```
+
+## Ascl vs Gli for cluster dNSC
+
+```{r,  warning = FALSE}
+DefaultAssay(d) <- "RNA"
+Idents(d) <- 'combi'
+
+markers <- FindMarkers(d,
+                       ident.1 =  'Ascl1_dNSC',
+                       ident.2 = 'Gli1_dNSC',
+                       test.use = "LR",
+                       latent.vars = "alt_batch",
+                       min.pct = 0.2)
+
+markers <- markers[order(markers$p_val_adj),]
+markers <- markers[markers$p_val_adj < 0.05,]
+markers$analysis <- 'ascldnsc_glidnsc_lr'
+markers <- data.frame(gene = rownames(markers),
+                      markers)
+
+DT::datatable(markers %>% as.data.frame() %>% dplyr::mutate_if(is.numeric, 
+    funs(round(., 2))), extensions = c("Buttons", "FixedColumns"), 
+    rownames = FALSE, options = list(dom = "Bfrtip", scrollX = TRUE, 
+        fixedColumns = list(leftColumns = 1), buttons = c("csv", 
+                                                          "excel")))
+
+```
+
+
+```{r, fig.width = 6, fig.height = 12, warning = FALSE, message = FALSE}
+Idents(d) <- 'combi'
+RidgePlot(d, head(rownames(markers)), ncol = 2)
+```
+
+## Ascl vs Gli for cluster IN
+
+```{r,  warning = FALSE}
+DefaultAssay(d) <- "RNA"
+Idents(d) <- 'combi'
+
+markers <- FindMarkers(d,
+                       ident.1 =  'Ascl1_IN',
+                       ident.2 = 'Gli1_IN',
+                       test.use = "LR",
+                       latent.vars = "alt_batch",
+                       min.pct = 0.2)
+
+markers <- markers[order(markers$p_val_adj),]
+markers <- markers[markers$p_val_adj < 0.05,]
+markers$analysis <- 'asclin_gliin_lr'
+markers <- data.frame(gene = rownames(markers),
+                      markers)
+
+DT::datatable(markers %>% as.data.frame() %>% dplyr::mutate_if(is.numeric, 
+    funs(round(., 2))), extensions = c("Buttons", "FixedColumns"), 
+    rownames = FALSE, options = list(dom = "Bfrtip", scrollX = TRUE, 
+        fixedColumns = list(leftColumns = 1), buttons = c("csv", 
+                                                          "excel")))
+
+```
+
+
+```{r, fig.width = 6, fig.height = 12, warning = FALSE, message = FALSE}
+Idents(d) <- 'combi'
+RidgePlot(d, head(rownames(markers)), ncol = 2)
+```
+
+## Ascl vs Gli for cluster MN
+
+```{r,  warning = FALSE}
+DefaultAssay(d) <- "RNA"
+Idents(d) <- 'combi'
+
+markers <- FindMarkers(d,
+                       ident.1 =  'Ascl1_MN',
+                       ident.2 = 'Gli1_MN',
+                       test.use = "LR",
+                       latent.vars = "alt_batch",
+                       min.pct = 0.2)
+
+markers <- markers[order(markers$p_val_adj),]
+markers <- markers[markers$p_val_adj < 0.05,]
+markers$analysis <- 'asclmn_glimn_lr'
+markers <- data.frame(gene = rownames(markers),
+                      markers)
+
+DT::datatable(markers %>% as.data.frame() %>% dplyr::mutate_if(is.numeric, 
+    funs(round(., 2))), extensions = c("Buttons", "FixedColumns"), 
+    rownames = FALSE, options = list(dom = "Bfrtip", scrollX = TRUE, 
+        fixedColumns = list(leftColumns = 1), buttons = c("csv", 
+                                                          "excel")))
+
+```
+
+
+```{r, fig.width = 6, fig.height = 12, warning = FALSE, message = FALSE}
+Idents(d) <- 'combi'
+RidgePlot(d, head(rownames(markers)), ncol = 2)
+```
+
+
+# Session
+
+```{r sessionInfo, cache = 0}
+
+date()
+devtools::session_info()
+
+
+```
