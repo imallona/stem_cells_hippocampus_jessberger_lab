@@ -1,8 +1,6 @@
 ## Aim
 
-Supplementary data to _Lorem ipsum dolor sit amet, consectetur adipiscing elit_.
-
-Lorem ipsum dolor sit amet, consectetur adipiscing elit. Proin lacinia neque enim, vel egestas elit lobortis sit amet. Fusce ultrices odio at leo porttitor lacinia. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Curabitur ex purus, auctor eu egestas et, lobortis in nisl. Vivamus pharetra efficitur felis. Donec tincidunt scelerisque magna, sed rutrum quam interdum ac. Donec suscipit ultricies cursus. Proin sodales porttitor nisl venenatis rutrum. Fusce ac faucibus dui. Fusce dictum mauris turpis, id lacinia sapien semper ac. Etiam at urna eget sapien fringilla bibendum. Donec finibus vestibulum purus, sed lacinia nulla malesuada nec.
+Transcriptional comparison between Gli1- and Ascl1- targeted neuronal stem cells (NSCs) isolated from the adult mouse hippocampus.
 
 ## Repository structure
 
@@ -13,6 +11,7 @@ Tasks (`01`, `02`, etc) subfolders contain both source code in R (`Rmd` files) a
 - `02_mapping`, STAR + featurecounts + velocyto workflow to retrieve count matrices and velocyto's loom files.
 - `03_diff_expression`, differential expression analysis (Seurat-based).
 - `04_velocyto`, `velocyto.R`-based run.
+- `05_prediction`, Machine Learning approach to predict Gli vs Ascl cells 
 
 ## Requirements
 
@@ -24,6 +23,7 @@ sickle v1.33
 STAR v2.6.0c
 subread v1.6.2 (featurecounts)
 velocyto.py v0.17.17
+caret v6.0.84
 ```
 
 R packages
@@ -43,7 +43,9 @@ R packages
  Seurat               * 3.0.0     2019-04-15 [1] CRAN (R 3.6.0)
  SingleCellExperiment * 1.6.0     2019-05-02 [1] Bioconductor  
  tsne                   0.1-3     2016-07-15 [1] CRAN (R 3.6.0)
- ```
+ purrr                  0.3.2	  2019-03-15 [1] CRAN (R 3.6.1)
+ dplyr			0.8.3	  2019-07-04 [1] cran (R 3.6.1)
+```
 
 ## To do list
 

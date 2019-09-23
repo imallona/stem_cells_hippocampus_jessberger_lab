@@ -1,0 +1,254 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.1'
+      jupytext_version: 1.2.3
+  kernelspec:
+    display_name: R
+    language: R
+    name: ir
+---
+
+
+```{r libraries, include=FALSE, cache=FALSE}
+library(caret)
+library(purrr)
+library(dplyr)
+library(parallel)
+
+```
+
+#Context
+
+We used Machine learning apporaches to show that we can distinguish between Gli1 and Ascl1 cells using
+DEG, which are common to ndNSC and dNSC, that were computer in 03_diff_expression.Rmd.
+!! This script was run in a 8CPU | 16GB RAM machine.
+
+# Function for randomly sample the dataset into train and test
+
+```{r function}
+# p is a proportion of data to use for training (it takes the proportion of the less populated class of cells)
+# i.e. if Ascl1 cells in total are 62 and Gli 120, then the training set will consist of 50% Ascl = 31 and 31 of Gli
+create_dataset_train_test_randomsampling = function(df, p , seed) {
+set.seed(seed)
+# Transpose matrix to have cells as rows
+if(any(grep("Ascl", colnames(df)) == T))
+{
+    df = t(as.matrix(df))
+}
+
+
+                        ### Train dataset
+    
+## Split data separately for Gli and Ascl to have the same proportion
+n_G = grep("Gli1", rownames(df))
+n_A = grep("Ascl1", rownames(df))
+min = min(length(n_A), length(n_G))
+
+# modify min to select the same number os cells for training
+n_Asampled = sample(n_A, size = min * p, replace = F)
+n_Gsampled = sample(n_G, size = min * p, replace = F)
+df_train = df[c(n_Asampled,n_Gsampled),]
+df_test = df[-c(n_Asampled,n_Gsampled),]
+
+    
+# Generate labels for the Gli and Ascl dataset
+vec = seq(1, nrow(df_train), 1)
+label = ifelse(vec %in% grep("Gli", rownames(df_train)), "Gli_5d", "Ascl1_5d") %>% as.factor
+
+                    #### Test dataset
+
+# Generate label for test dataset
+vec = seq(1, nrow(df_test), 1)
+data_test_result = ifelse(vec %in% grep("Gli", rownames(df_test)), "Gli_5d", "Ascl1_5d") %>% as.factor    
+
+    print(paste0("Total percentage of cells used for training: ", min * p * 2 / nrow(df)))
+    ret = list(
+        df_train = df_train,
+        df_test = df_test,
+        data_test_result = data_test_result,
+        label = label)
+    return(ret)
+    
+    
+}
+```
+
+# Load data and genes
+
+```{r}
+data_all = readRDS(file.path('..', 'data', 'matrix_allcells_allgenes.rds')) %>% as.data.frame
+# Read the batch affected genes and take the once with p_val_adj == 0
+
+batch_genes = openxlsx::read.xlsx(file.path('..', 'data', 'batch_genes.xlsx'), 1)
+batch_genes = batch_genes[which(batch_genes$p_val_adj < 0.01),]
+
+genes_dNSC = readRDS(file.path('..', 'data', 'diff_expression_dNSC.rds'))
+genes_ndNSC = readRDS(file.path('..', 'data', 'diff_expression_ndNSC.rds'))
+
+genes_model = intersect(genes_dNSC,genes_ndNSC)
+
+# Create vector with ndNSC and a vector with dNSC cells
+
+#dNSC
+x = which(pbmc.combined@meta.data$cluster == "dNSC")
+cells_dNSC = rownames(pbmc.combined@meta.data)[x]
+#ndNSC
+x= which(pbmc.combined@meta.data$cluster == "ndNSC") 
+cells_ndNSC = rownames(pbmc.combined@meta.data)[x]
+cells_ndNSC_dNSC = append(cells_dNSC,cells_ndNSC)
+
+data = data_all[genes_model, cells_ndNSC_dNSC]
+
+# Check wheter we have correct data (9 330)
+dim(data) 
+
+```
+
+# Model Fitting
+
+```{r}
+# Use all data_pred of ascl and gli independently of the day and do random sampling
+seeds = seq(1,1000,1)
+
+# Setup cluster
+cl <- makeCluster(detectCores())
+
+# Loading all packages necesary | variables | functions
+invisible(clusterEvalQ(cl, library("dplyr")))
+invisible(clusterEvalQ(cl, library("caret")))
+clusterExport(cl, c("create_dataset_train_test_randomsampling"), envir = environment())
+clusterExport(cl, c("data"), envir = environment())
+
+output_9_genes_3models_1000seed = parLapply(cl,seeds, function(seed) {
+    dataset_rf_randomsampling = create_dataset_train_test_randomsampling(data, 0.5, seed)
+
+
+    # Data
+    data_train = dataset_rf_randomsampling$df_train %>% data.frame
+    data_train$label = dataset_rf_randomsampling$label
+    data_test = dataset_rf_randomsampling$df_test
+    result = as.factor(dataset_rf_randomsampling$data_test_result)
+    
+    set.seed(1)
+    # train the models
+    models = c("glm","knn","rf")
+    fits <- lapply(models, function(model){ 
+        ctrl = trainControl(method = "cv", number = 10, p = 0.9)
+        model = train(label ~ . ,method = model, data = data_train, trControl = ctrl)
+        pred = predict(model, data_test)
+        f_meas = caret::F_meas(pred, result)
+        acc = mean(pred == result)
+        return(list(model = model,
+                    pred = pred,
+                    f_meas = f_meas,
+                    acc = acc,
+                    result = result,
+                    dataset_rf_randomsampling1 = dataset_rf_randomsampling$df_test))
+    })
+    names(fits) <- models
+
+    return(fits)
+})
+stopCluster(cl)
+
+```
+
+# Calculate the mean accuracy for each model
+
+```{r}
+mean(map_dbl(seq(1,1000,1), function(x){output_9_genes_3models_1000seed[[x]]$knn$acc}))
+mean(map_dbl(seq(1,1000,1), function(x){output_9_genes_3models_1000seed[[x]]$rf$acc}))
+mean(map_dbl(seq(1,1000,1), function(x){output_9_genes_3models_1000seed[[x]]$glm$acc}))
+```
+
+# Generate scores
+
+```{r}
+
+# Calculate the final Enseble scores over 1000 seeds and combining all 3 models
+output_list = output_9_genes_3models_1000seed
+
+total_cell_names = colnames(data)
+
+# Create matrices
+list_final = list(cells = total_cell_names, score = rep(0, length(total_cell_names)))
+
+# add scores (+1) to the cell that was correctly classified and (-1) otherwise
+models = c("glm","knn","rf")
+seed = seq(1,1000,1)
+# Loop over the seeds
+for(i in 1:length(seed))
+{
+    # Loop over the models
+    for(j in 1:length(models)) 
+    {
+        true_cell_names = output_list[[i]][[models[j]]]$dataset_rf_randomsampling1 %>% rownames 
+        # Loop over each predicted cell in the model
+        for(k in 1:length(output_list[[i]][[models[j]]]$pred))
+        {
+            cell_predicted = output_list[[i]][[models[j]]]$pred[k]
+            cell_true = output_list[[i]][[models[j]]]$result[k]
+            
+            # If the prediction was correct add +1 to score of this cell and -1 otherwise
+            if(cell_predicted == cell_true)
+            {
+                n = which(list_final[["cells"]] == true_cell_names[k])
+                list_final[["score"]][[n]] = list_final[["score"]][[n]] + 1
+            }
+            else
+            {
+                n = which(list_final[["cells"]] == true_cell_names[k])
+                list_final[["score"]][[n]] = list_final[["score"]][[n]] - 1
+            }
+        }
+    }
+}
+
+df_final = as.data.frame(list_final)
+
+```
+
+```{r}
+                            # Final label for the prediction
+                            
+# If the score is negative then the cell was not correctly classified
+df_final$result = 0
+
+# The true classes of each cell
+df_final$true = 0
+for(i in 1:nrow(df_final))
+{
+    if(any(grep("Gli", df_final$cells[i])) & df_final$score[i] < 0)
+    {
+        df_final$result[i] = "Ascl1_5d"
+        df_final$true[i] = "Gli1_5d"
+    } 
+    else if (any(grep("Ascl", df_final$cells[i])) & df_final$score[i] < 0)
+    {
+        df_final$result[i] = "Gli1_5d"
+        df_final$true[i] = "Ascl1_5d"
+    } 
+    else if(any(grep("Ascl", df_final$cells[i])) & df_final$score[i] > 0)
+    {
+
+        df_final$result[i] = "Ascl1_5d"
+        df_final$true[i] = "Ascl1_5d"
+    } 
+    else if(any(grep("Gli", df_final$cells[i])) & df_final$score[i] > 0)
+    {
+        df_final$result[i] = "Gli1_5d"
+        df_final$true[i] = "Gli1_5d"
+    }
+}
+```
+
+
+# The final accuracy of the Ensemble
+
+```{r}
+mean(df_final$result == df_final$true)
+```
