@@ -47,7 +47,11 @@ R packages
  dplyr			0.8.3	  2019-07-04 [1] cran (R 3.6.1)
 ```
 
+# Data availability
+
+- [GSE138941](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE138941) includes raw data and count tables.
+
 ## To do list
 
-- add links to GEO/SRA data
+- add link to the paper
 - document
