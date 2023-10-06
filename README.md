@@ -1,3 +1,6 @@
+Note: 
+This github repository contains the main parts of the analysis described below. Nevertheless, as this was a collaborative effort, additional methods or steps that could be potentially missing here, can be viewed at https://github.com/vkorobeynyk/scRNA-seq_analysis_jessberger_lab 
+
 ## Aim
 
 Transcriptional comparison between Gli1- and Ascl1- targeted neuronal stem cells (NSCs) isolated from the adult mouse hippocampus.
@@ -51,7 +54,10 @@ R packages
 
 - [GSE138941](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE138941) includes raw data and count tables.
 
+# Publication link
+
+- [Bottes, S., Jaeger, B.N., Pilz, GA. et al. Long-term self-renewing stem cells in the adult mouse hippocampus identified by intravital imaging. Nat Neurosci 24, 225–233 (2021). https://doi.org/10.1038/s41593-020-00759-4](https://www.nature.com/articles/s41593-020-00759-4)
+  
 ## To do list
 
-- add link to the paper
 - document
